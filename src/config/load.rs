@@ -22,6 +22,14 @@ const MAX_ME_ROUTE_CHANNEL_CAPACITY: usize = 8_192;
 const MAX_ME_C2ME_CHANNEL_CAPACITY: usize = 8_192;
 const MIN_MAX_CLIENT_FRAME_BYTES: usize = 4 * 1024;
 const MAX_MAX_CLIENT_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_API_REQUEST_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+fn is_valid_tls_domain_name(domain: &str) -> bool {
+    !domain.is_empty()
+        && !domain
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '\\'))
+}
 
 const TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "general",
@@ -1773,9 +1781,11 @@ impl ProxyConfig {
             ));
         }
 
-        if config.server.api.request_body_limit_bytes == 0 {
+        if !(1..=MAX_API_REQUEST_BODY_LIMIT_BYTES)
+            .contains(&config.server.api.request_body_limit_bytes)
+        {
             return Err(ProxyError::Config(
-                "server.api.request_body_limit_bytes must be > 0".to_string(),
+                "server.api.request_body_limit_bytes must be within [1, 1048576]".to_string(),
             ));
         }
 
@@ -2103,11 +2113,20 @@ impl ProxyConfig {
             return Err(ProxyError::Config("No modes enabled".to_string()));
         }
 
-        if self.censorship.tls_domain.contains(' ') || self.censorship.tls_domain.contains('/') {
+        if !is_valid_tls_domain_name(&self.censorship.tls_domain) {
             return Err(ProxyError::Config(format!(
                 "Invalid tls_domain: '{}'. Must be a valid domain name",
                 self.censorship.tls_domain
             )));
+        }
+
+        for domain in &self.censorship.tls_domains {
+            if !is_valid_tls_domain_name(domain) {
+                return Err(ProxyError::Config(format!(
+                    "Invalid tls_domains entry: '{}'. Must be a valid domain name",
+                    domain
+                )));
+            }
         }
 
         for (user, tag) in &self.access.user_ad_tags {

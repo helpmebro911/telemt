@@ -78,11 +78,11 @@ pub async fn serve(
         return;
     }
 
-    // Fallback: bind on 0.0.0.0 and [::] using metrics_port.
+    // Fallback: keep metrics local unless an explicit metrics_listen is configured.
     let mut listener_v4 = None;
     let mut listener_v6 = None;
 
-    let addr_v4 = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr_v4 = SocketAddr::from(([127, 0, 0, 1], port));
     match bind_metrics_listener(addr_v4, false, listen_backlog) {
         Ok(listener) => {
             info!(
@@ -96,11 +96,11 @@ pub async fn serve(
         }
     }
 
-    let addr_v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port));
+    let addr_v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port));
     match bind_metrics_listener(addr_v6, true, listen_backlog) {
         Ok(listener) => {
             info!(
-                "Metrics endpoint: http://[::]:{}/metrics and /beobachten",
+                "Metrics endpoint: http://[::1]:{}/metrics and /beobachten",
                 port
             );
             listener_v6 = Some(listener);

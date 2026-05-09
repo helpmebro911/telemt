@@ -13,6 +13,7 @@ use hyper::header::AUTHORIZATION;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock, Semaphore, watch};
 use tokio::time::timeout;
@@ -46,6 +47,7 @@ use http_utils::{error_response, read_json, read_optional_json, success_response
 use model::{
     ApiFailure, ClassCount, CreateUserRequest, DeleteUserResponse, HealthData, HealthReadyData,
     PatchUserRequest, ResetUserQuotaResponse, RotateSecretRequest, SummaryData, UserActiveIps,
+    is_valid_username,
 };
 use runtime_edge::{
     EdgeConnectionsCacheEntry, build_runtime_connections_summary_data,
@@ -70,6 +72,7 @@ use users::{create_user, delete_user, patch_user, rotate_secret, users_from_conf
 
 const API_MAX_CONTROL_CONNECTIONS: usize = 1024;
 const API_HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
+const ROUTE_USERNAME_ERROR: &str = "username must match [A-Za-z0-9_.-] and be 1..64 chars";
 
 pub(super) struct ApiRuntimeState {
     pub(super) process_started_at_epoch_secs: u64,
@@ -105,6 +108,18 @@ impl ApiShared {
 
     fn detected_link_ips(&self) -> (Option<IpAddr>, Option<IpAddr>) {
         *self.detected_ips_rx.borrow()
+    }
+}
+
+fn auth_header_matches(actual: &str, expected: &str) -> bool {
+    actual.as_bytes().ct_eq(expected.as_bytes()).into()
+}
+
+fn parse_route_username(user: &str) -> Result<&str, ApiFailure> {
+    if is_valid_username(user) {
+        Ok(user)
+    } else {
+        Err(ApiFailure::bad_request(ROUTE_USERNAME_ERROR))
     }
 }
 
@@ -277,7 +292,7 @@ async fn handle(
             .headers()
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .map(|v| v == api_cfg.auth_header)
+            .map(|v| auth_header_matches(v, &api_cfg.auth_header))
             .unwrap_or(false);
         if !auth_ok {
             return Ok(error_response(
@@ -533,6 +548,7 @@ async fn handle(
                     && !user.is_empty()
                     && !user.contains('/')
                 {
+                    let user = parse_route_username(user)?;
                     if api_cfg.read_only {
                         return Ok(error_response(
                             request_id,
@@ -576,10 +592,64 @@ async fn handle(
                         revision,
                     ));
                 }
+                if method == Method::POST
+                    && let Some(base_user) = normalized_path
+                        .strip_prefix("/v1/users/")
+                        .and_then(|path| path.strip_suffix("/rotate-secret"))
+                    && !base_user.is_empty()
+                    && !base_user.contains('/')
+                {
+                    let base_user = parse_route_username(base_user)?;
+                    if api_cfg.read_only {
+                        return Ok(error_response(
+                            request_id,
+                            ApiFailure::new(
+                                StatusCode::FORBIDDEN,
+                                "read_only",
+                                "API runs in read-only mode",
+                            ),
+                        ));
+                    }
+                    let expected_revision = parse_if_match(req.headers());
+                    let body =
+                        read_optional_json::<RotateSecretRequest>(req.into_body(), body_limit)
+                            .await?;
+                    let result = rotate_secret(
+                        base_user,
+                        body.unwrap_or_default(),
+                        expected_revision,
+                        &shared,
+                    )
+                    .await;
+                    let (mut data, revision) = match result {
+                        Ok(ok) => ok,
+                        Err(error) => {
+                            shared.runtime_events.record(
+                                "api.user.rotate_secret.failed",
+                                format!("username={} code={}", base_user, error.code),
+                            );
+                            return Err(error);
+                        }
+                    };
+                    let runtime_cfg = config_rx.borrow().clone();
+                    data.user.in_runtime =
+                        runtime_cfg.access.users.contains_key(&data.user.username);
+                    shared.runtime_events.record(
+                        "api.user.rotate_secret.ok",
+                        format!("username={}", base_user),
+                    );
+                    let status = if data.user.in_runtime {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::ACCEPTED
+                    };
+                    return Ok(success_response(status, data, revision));
+                }
                 if let Some(user) = normalized_path.strip_prefix("/v1/users/")
                     && !user.is_empty()
                     && !user.contains('/')
                 {
+                    let user = parse_route_username(user)?;
                     if method == Method::GET {
                         let revision = current_revision(&shared.config_path).await?;
                         let disk_cfg = load_config_from_disk(&shared.config_path).await?;
@@ -679,56 +749,6 @@ async fn handle(
                             StatusCode::OK
                         };
                         return Ok(success_response(status, response, revision));
-                    }
-                    if method == Method::POST
-                        && let Some(base_user) = user.strip_suffix("/rotate-secret")
-                        && !base_user.is_empty()
-                        && !base_user.contains('/')
-                    {
-                        if api_cfg.read_only {
-                            return Ok(error_response(
-                                request_id,
-                                ApiFailure::new(
-                                    StatusCode::FORBIDDEN,
-                                    "read_only",
-                                    "API runs in read-only mode",
-                                ),
-                            ));
-                        }
-                        let expected_revision = parse_if_match(req.headers());
-                        let body =
-                            read_optional_json::<RotateSecretRequest>(req.into_body(), body_limit)
-                                .await?;
-                        let result = rotate_secret(
-                            base_user,
-                            body.unwrap_or_default(),
-                            expected_revision,
-                            &shared,
-                        )
-                        .await;
-                        let (mut data, revision) = match result {
-                            Ok(ok) => ok,
-                            Err(error) => {
-                                shared.runtime_events.record(
-                                    "api.user.rotate_secret.failed",
-                                    format!("username={} code={}", base_user, error.code),
-                                );
-                                return Err(error);
-                            }
-                        };
-                        let runtime_cfg = config_rx.borrow().clone();
-                        data.user.in_runtime =
-                            runtime_cfg.access.users.contains_key(&data.user.username);
-                        shared.runtime_events.record(
-                            "api.user.rotate_secret.ok",
-                            format!("username={}", base_user),
-                        );
-                        let status = if data.user.in_runtime {
-                            StatusCode::OK
-                        } else {
-                            StatusCode::ACCEPTED
-                        };
-                        return Ok(success_response(status, data, revision));
                     }
                     if method == Method::POST {
                         return Ok(error_response(
