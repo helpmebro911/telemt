@@ -13,7 +13,7 @@ API runtime is configured in `[server.api]`.
 | `listen` | `string` (`IP:PORT`) | `0.0.0.0:9091` | API bind address. |
 | `whitelist` | `CIDR[]` | `127.0.0.0/8` | Source IP allowlist. Empty list means allow all. |
 | `auth_header` | `string` | `""` | Exact value for `Authorization` header. Empty disables header auth. |
-| `request_body_limit_bytes` | `usize` | `65536` | Maximum request body size. Must be `> 0`. |
+| `request_body_limit_bytes` | `usize` | `65536` | Maximum request body size. Must be within `[1, 1048576]`. |
 | `minimal_runtime_enabled` | `bool` | `true` | Enables runtime snapshot endpoints requiring ME pool read-lock aggregation. |
 | `minimal_runtime_cache_ttl_ms` | `u64` | `1000` | Cache TTL for minimal snapshots. `0` disables cache; valid range is `[0, 60000]`. |
 | `runtime_edge_enabled` | `bool` | `false` | Enables runtime edge endpoints with cached aggregation payloads. |
@@ -26,7 +26,7 @@ API runtime is configured in `[server.api]`.
 
 Runtime validation for API config:
 - `server.api.listen` must be a valid `IP:PORT`.
-- `server.api.request_body_limit_bytes` must be `> 0`.
+- `server.api.request_body_limit_bytes` must be within `[1, 1048576]`.
 - `server.api.minimal_runtime_cache_ttl_ms` must be within `[0, 60000]`.
 - `server.api.runtime_edge_cache_ttl_ms` must be within `[0, 60000]`.
 - `server.api.runtime_edge_top_n` must be within `[1, 1000]`.
@@ -76,13 +76,14 @@ Requests are processed in this order:
 
 Notes:
 - Whitelist is evaluated against the direct TCP peer IP (`SocketAddr::ip`), without `X-Forwarded-For` support.
-- `Authorization` check is exact string equality against configured `auth_header`.
+- `Authorization` check is exact constant-time byte equality against configured `auth_header`.
 
 ## Endpoint Matrix
 
 | Method | Path | Body | Success | `data` contract |
 | --- | --- | --- | --- | --- |
 | `GET` | `/v1/health` | none | `200` | `HealthData` |
+| `GET` | `/v1/health/ready` | none | `200` or `503` | `HealthReadyData` |
 | `GET` | `/v1/system/info` | none | `200` | `SystemInfoData` |
 | `GET` | `/v1/runtime/gates` | none | `200` | `RuntimeGatesData` |
 | `GET` | `/v1/runtime/initialization` | none | `200` | `RuntimeInitializationData` |
@@ -102,13 +103,50 @@ Notes:
 | `GET` | `/v1/runtime/me-selftest` | none | `200` | `RuntimeMeSelftestData` |
 | `GET` | `/v1/runtime/connections/summary` | none | `200` | `RuntimeEdgeConnectionsSummaryData` |
 | `GET` | `/v1/runtime/events/recent` | none | `200` | `RuntimeEdgeEventsData` |
+| `GET` | `/v1/stats/users/active-ips` | none | `200` | `UserActiveIps[]` |
 | `GET` | `/v1/stats/users` | none | `200` | `UserInfo[]` |
 | `GET` | `/v1/users` | none | `200` | `UserInfo[]` |
-| `POST` | `/v1/users` | `CreateUserRequest` | `201` | `CreateUserResponse` |
+| `POST` | `/v1/users` | `CreateUserRequest` | `201` or `202` | `CreateUserResponse` |
 | `GET` | `/v1/users/{username}` | none | `200` | `UserInfo` |
-| `PATCH` | `/v1/users/{username}` | `PatchUserRequest` | `200` | `UserInfo` |
-| `DELETE` | `/v1/users/{username}` | none | `200` | `string` (deleted username) |
-| `POST` | `/v1/users/{username}/rotate-secret` | `RotateSecretRequest` or empty body | `404` | `ErrorResponse` (`not_found`, current runtime behavior) |
+| `PATCH` | `/v1/users/{username}` | `PatchUserRequest` | `200` or `202` | `UserInfo` |
+| `DELETE` | `/v1/users/{username}` | none | `200` or `202` | `DeleteUserResponse` |
+| `POST` | `/v1/users/{username}/rotate-secret` | `RotateSecretRequest` or empty body | `200` or `202` | `CreateUserResponse` |
+| `POST` | `/v1/users/{username}/reset-quota` | empty body | `200` | `ResetUserQuotaResponse` |
+
+## Endpoint Behavior
+
+| Endpoint | Function |
+| --- | --- |
+| `GET /v1/health` | Returns basic API liveness and current `read_only` flag. |
+| `GET /v1/health/ready` | Returns readiness based on admission state and upstream health; returns `503` when not ready. |
+| `GET /v1/system/info` | Returns binary/build metadata, process uptime, config path/hash, and reload counters. |
+| `GET /v1/runtime/gates` | Returns admission, ME readiness, fallback/reroute, and startup gate state. |
+| `GET /v1/runtime/initialization` | Returns startup progress, ME initialization status, and per-component timeline. |
+| `GET /v1/limits/effective` | Returns effective timeout, upstream, ME, unique-IP, and TCP policy values after config defaults/resolution. |
+| `GET /v1/security/posture` | Returns current API/security/telemetry posture flags. |
+| `GET /v1/security/whitelist` | Returns configured API whitelist CIDRs. |
+| `GET /v1/stats/summary` | Returns compact core counters and classed failure counters. |
+| `GET /v1/stats/zero/all` | Returns zero-cost core, upstream, ME, pool, and desync counters. |
+| `GET /v1/stats/upstreams` | Returns upstream zero counters and, when enabled/available, runtime upstream health rows. |
+| `GET /v1/stats/minimal/all` | Returns cached minimal ME writer/DC/runtime/network-path snapshot. |
+| `GET /v1/stats/me-writers` | Returns cached ME writer coverage and per-writer status rows. |
+| `GET /v1/stats/dcs` | Returns cached per-DC endpoint/writer/load status rows. |
+| `GET /v1/runtime/me_pool_state` | Returns active/warm/pending/draining generation state, writer contour/health, and refill state. |
+| `GET /v1/runtime/me_quality` | Returns ME lifecycle counters, route-drop counters, family states, drain gate, and per-DC RTT/coverage. |
+| `GET /v1/runtime/upstream_quality` | Returns upstream policy/counters plus runtime upstream health rows when available. |
+| `GET /v1/runtime/nat_stun` | Returns NAT/STUN runtime flags, configured/live STUN servers, reflection cache, and backoff. |
+| `GET /v1/runtime/me-selftest` | Returns ME self-test state for KDF, time skew, IP family, PID, and SOCKS BND observations. |
+| `GET /v1/runtime/connections/summary` | Returns runtime-edge connection totals and top-N users by connections/throughput. |
+| `GET /v1/runtime/events/recent` | Returns recent API/runtime event records with optional `limit` query. |
+| `GET /v1/stats/users/active-ips` | Returns users that currently have non-empty active source-IP lists. |
+| `GET /v1/stats/users` | Alias of `GET /v1/users`; returns disk-first user views with runtime lag flag. |
+| `GET /v1/users` | Returns disk-first user views sorted by username. |
+| `POST /v1/users` | Creates a user and returns the effective user view plus secret. |
+| `GET /v1/users/{username}` | Returns one disk-first user view or `404` when absent. |
+| `PATCH /v1/users/{username}` | Updates selected per-user fields with JSON Merge Patch semantics. |
+| `DELETE /v1/users/{username}` | Deletes one user and related per-user access-map entries. |
+| `POST /v1/users/{username}/rotate-secret` | Rotates one user's secret and returns the effective secret. |
+| `POST /v1/users/{username}/reset-quota` | Resets one user's runtime quota counter and persists quota state. |
 
 ## Common Error Codes
 
@@ -118,7 +156,7 @@ Notes:
 | `401` | `unauthorized` | Missing/invalid `Authorization` when `auth_header` is configured. |
 | `403` | `forbidden` | Source IP is not allowed by whitelist. |
 | `403` | `read_only` | Mutating endpoint called while `read_only=true`. |
-| `404` | `not_found` | Unknown route, unknown user, or unsupported sub-route (including current `rotate-secret` route). |
+| `404` | `not_found` | Unknown route, unknown user, or unsupported sub-route. |
 | `405` | `method_not_allowed` | Unsupported method for `/v1/users/{username}` route shape. |
 | `409` | `revision_conflict` | `If-Match` revision mismatch. |
 | `409` | `user_exists` | User already exists on create. |
@@ -132,11 +170,12 @@ Notes:
 | Case | Behavior |
 | --- | --- |
 | Path matching | Exact match on `req.uri().path()`. Query string does not affect route matching. |
-| Trailing slash | Not normalized. Example: `/v1/users/` is `404`. |
+| Trailing slash | Trimmed for route matching when path length is greater than 1. Example: `/v1/users/` matches `/v1/users`. |
 | Username route with extra slash | `/v1/users/{username}/...` is not treated as user route and returns `404`. |
 | `PUT /v1/users/{username}` | `405 method_not_allowed`. |
 | `POST /v1/users/{username}` | `404 not_found`. |
-| `POST /v1/users/{username}/rotate-secret` | `404 not_found` in current release due route matcher limitation. |
+| `POST /v1/users/{username}/rotate-secret/` | Trailing slash is trimmed and the route matches `rotate-secret`. |
+| `POST /v1/users/{username}/reset-quota/` | Trailing slash is trimmed and the route matches `reset-quota`. |
 
 ## Body and JSON Semantics
 
@@ -146,7 +185,7 @@ Notes:
 - Invalid JSON returns `400 bad_request` (`Invalid JSON body`).
 - `Content-Type` is not required for JSON parsing.
 - Unknown JSON fields are ignored by deserialization.
-- `PATCH` updates only provided fields and does not support explicit clearing of optional fields.
+- `PATCH` uses JSON Merge Patch semantics for optional per-user fields: omitted means unchanged, explicit `null` removes the config entry, and a non-null value sets it.
 - `If-Match` supports both quoted and unquoted values; surrounding whitespace is trimmed.
 
 ## Query Parameters
@@ -172,11 +211,11 @@ Notes:
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `secret` | `string` | no | Exactly 32 hex chars. |
-| `user_ad_tag` | `string` | no | Exactly 32 hex chars. |
-| `max_tcp_conns` | `usize` | no | Per-user concurrent TCP limit. |
-| `expiration_rfc3339` | `string` | no | RFC3339 expiration timestamp. |
-| `data_quota_bytes` | `u64` | no | Per-user traffic quota. |
-| `max_unique_ips` | `usize` | no | Per-user unique source IP limit. |
+| `user_ad_tag` | `string|null` | no | Exactly 32 hex chars; `null` removes the per-user ad tag. |
+| `max_tcp_conns` | `usize|null` | no | Per-user concurrent TCP limit; `null` removes the per-user override. |
+| `expiration_rfc3339` | `string|null` | no | RFC3339 expiration timestamp; `null` removes the expiration. |
+| `data_quota_bytes` | `u64|null` | no | Per-user traffic quota; `null` removes the per-user quota. |
+| `max_unique_ips` | `usize|null` | no | Per-user unique source IP limit; `null` removes the per-user override. |
 
 ### `access.user_source_deny` via API
 - In current API surface, per-user deny-list is **not** exposed as a dedicated field in `CreateUserRequest` / `PatchUserRequest`.
@@ -198,7 +237,7 @@ bob = ["198.51.100.42/32"]
 | --- | --- | --- | --- |
 | `secret` | `string` | no | Exactly 32 hex chars. If missing, generated automatically. |
 
-Note: the request contract is defined, but the corresponding route currently returns `404` (see routing edge cases).
+An empty request body is accepted and generates a new secret automatically.
 
 ## Response Data Contracts
 
@@ -208,14 +247,32 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `status` | `string` | Always `"ok"`. |
 | `read_only` | `bool` | Mirrors current API `read_only` mode. |
 
+### `HealthReadyData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `ready` | `bool` | `true` when admission is open and at least one upstream is healthy. |
+| `status` | `string` | `"ready"` or `"not_ready"`. |
+| `reason` | `string?` | `admission_closed` or `no_healthy_upstreams` when not ready. |
+| `admission_open` | `bool` | Current admission-gate state. |
+| `healthy_upstreams` | `usize` | Number of healthy upstream entries. |
+| `total_upstreams` | `usize` | Number of configured upstream entries. |
+
 ### `SummaryData`
 | Field | Type | Description |
 | --- | --- | --- |
 | `uptime_seconds` | `f64` | Process uptime in seconds. |
 | `connections_total` | `u64` | Total accepted client connections. |
 | `connections_bad_total` | `u64` | Failed/invalid client connections. |
+| `connections_bad_by_class` | `ClassCount[]` | Failed/invalid connections grouped by class. |
+| `handshake_failures_by_class` | `ClassCount[]` | Handshake failures grouped by class. |
 | `handshake_timeouts_total` | `u64` | Handshake timeout count. |
 | `configured_users` | `usize` | Number of configured users in config. |
+
+#### `ClassCount`
+| Field | Type | Description |
+| --- | --- | --- |
+| `class` | `string` | Failure class label. |
+| `total` | `u64` | Counter value for this class. |
 
 ### `SystemInfoData`
 | Field | Type | Description |
@@ -241,7 +298,12 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `conditional_cast_enabled` | `bool` | Whether conditional ME admission logic is enabled (`general.use_middle_proxy`). |
 | `me_runtime_ready` | `bool` | Current ME runtime readiness status used for conditional gate decisions. |
 | `me2dc_fallback_enabled` | `bool` | Whether ME -> direct fallback is enabled. |
+| `me2dc_fast_enabled` | `bool` | Whether fast ME -> direct fallback is enabled. |
 | `use_middle_proxy` | `bool` | Current transport mode preference. |
+| `route_mode` | `string` | Current route mode label from route runtime controller. |
+| `reroute_active` | `bool` | `true` when ME fallback currently routes new sessions to Direct-DC. |
+| `reroute_to_direct_at_epoch_secs` | `u64?` | Unix timestamp when current direct reroute began. |
+| `reroute_reason` | `string?` | `fast_not_ready_fallback` or `strict_grace_fallback` while reroute is active. |
 | `startup_status` | `string` | Startup status (`pending`, `initializing`, `ready`, `failed`, `skipped`). |
 | `startup_stage` | `string` | Current startup stage identifier. |
 | `startup_progress_pct` | `f64` | Startup progress percentage (`0..100`). |
@@ -292,11 +354,13 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `upstream` | `EffectiveUpstreamLimits` | Effective upstream connect/retry limits. |
 | `middle_proxy` | `EffectiveMiddleProxyLimits` | Effective ME pool/floor/reconnect limits. |
 | `user_ip_policy` | `EffectiveUserIpPolicyLimits` | Effective unique-IP policy mode/window. |
+| `user_tcp_policy` | `EffectiveUserTcpPolicyLimits` | Effective per-user TCP connection policy. |
 
 #### `EffectiveTimeoutLimits`
 | Field | Type | Description |
 | --- | --- | --- |
 | `client_handshake_secs` | `u64` | Client handshake timeout. |
+| `client_first_byte_idle_secs` | `u64` | First-byte idle timeout before protocol classification. |
 | `tg_connect_secs` | `u64` | Upstream Telegram connect timeout. |
 | `client_keepalive_secs` | `u64` | Client keepalive interval. |
 | `client_ack_secs` | `u64` | ACK timeout. |
@@ -335,12 +399,19 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `writer_pick_mode` | `string` | Writer picker mode (`sorted_rr`, `p2c`). |
 | `writer_pick_sample_size` | `u8` | Candidate sample size for `p2c` picker mode. |
 | `me2dc_fallback` | `bool` | Effective ME -> direct fallback flag. |
+| `me2dc_fast` | `bool` | Effective fast fallback flag. |
 
 #### `EffectiveUserIpPolicyLimits`
 | Field | Type | Description |
 | --- | --- | --- |
+| `global_each` | `usize` | Global per-user unique-IP limit applied when no per-user override exists. |
 | `mode` | `string` | Unique-IP policy mode (`active_window`, `time_window`, `combined`). |
 | `window_secs` | `u64` | Time window length used by unique-IP policy. |
+
+#### `EffectiveUserTcpPolicyLimits`
+| Field | Type | Description |
+| --- | --- | --- |
+| `global_each` | `usize` | Global per-user concurrent TCP limit applied when no per-user override exists. |
 
 ### `SecurityPostureData`
 | Field | Type | Description |
@@ -445,6 +516,8 @@ Note: the request contract is defined, but the corresponding route currently ret
 | --- | --- | --- |
 | `counters` | `RuntimeMeQualityCountersData` | Key ME lifecycle/error counters. |
 | `route_drops` | `RuntimeMeQualityRouteDropData` | Route drop counters by reason. |
+| `family_states` | `RuntimeMeQualityFamilyStateData[]` | Per-family ME route/recovery state rows. |
+| `drain_gate` | `RuntimeMeQualityDrainGateData` | Current ME drain-gate decision state. |
 | `dc_rtt` | `RuntimeMeQualityDcRttData[]` | Per-DC RTT and writer coverage rows. |
 
 #### `RuntimeMeQualityCountersData`
@@ -465,6 +538,24 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `queue_full_total` | `u64` | Route drops due queue backpressure (aggregate). |
 | `queue_full_base_total` | `u64` | Route drops in base-queue path. |
 | `queue_full_high_total` | `u64` | Route drops in high-priority queue path. |
+
+#### `RuntimeMeQualityFamilyStateData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `family` | `string` | Address family label. |
+| `state` | `string` | Current family state label. |
+| `state_since_epoch_secs` | `u64` | Unix timestamp when current state began. |
+| `suppressed_until_epoch_secs` | `u64?` | Unix timestamp until suppression remains active. |
+| `fail_streak` | `u32` | Consecutive failure count. |
+| `recover_success_streak` | `u32` | Consecutive recovery success count. |
+
+#### `RuntimeMeQualityDrainGateData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `route_quorum_ok` | `bool` | Whether route quorum condition allows drain. |
+| `redundancy_ok` | `bool` | Whether redundancy condition allows drain. |
+| `block_reason` | `string` | Current drain block reason label. |
+| `updated_at_epoch_secs` | `u64` | Unix timestamp of the latest gate update. |
 
 #### `RuntimeMeQualityDcRttData`
 | Field | Type | Description |
@@ -728,11 +819,24 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `uptime_seconds` | `f64` | Process uptime. |
 | `connections_total` | `u64` | Total accepted connections. |
 | `connections_bad_total` | `u64` | Failed/invalid connections. |
+| `connections_bad_by_class` | `ClassCount[]` | Failed/invalid connections grouped by class. |
+| `handshake_failures_by_class` | `ClassCount[]` | Handshake failures grouped by class. |
 | `handshake_timeouts_total` | `u64` | Handshake timeouts. |
+| `accept_permit_timeout_total` | `u64` | Listener admission permit acquisition timeouts. |
 | `configured_users` | `usize` | Configured user count. |
 | `telemetry_core_enabled` | `bool` | Core telemetry toggle. |
 | `telemetry_user_enabled` | `bool` | User telemetry toggle. |
 | `telemetry_me_level` | `string` | ME telemetry level (`off|normal|verbose`). |
+| `conntrack_control_enabled` | `bool` | Whether conntrack control is enabled by policy. |
+| `conntrack_control_available` | `bool` | Whether conntrack control backend is currently available. |
+| `conntrack_pressure_active` | `bool` | Current conntrack pressure flag. |
+| `conntrack_event_queue_depth` | `u64` | Current conntrack close-event queue depth. |
+| `conntrack_rule_apply_ok` | `bool` | Last conntrack rule application state. |
+| `conntrack_delete_attempt_total` | `u64` | Conntrack delete attempts. |
+| `conntrack_delete_success_total` | `u64` | Successful conntrack deletes. |
+| `conntrack_delete_not_found_total` | `u64` | Conntrack delete misses. |
+| `conntrack_delete_error_total` | `u64` | Conntrack delete errors. |
+| `conntrack_close_event_drop_total` | `u64` | Dropped conntrack close events. |
 
 #### `ZeroUpstreamData`
 | Field | Type | Description |
@@ -819,6 +923,24 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `route_drop_queue_full_total` | `u64` | Route drops due to full queue (total). |
 | `route_drop_queue_full_base_total` | `u64` | Route drops in base queue mode. |
 | `route_drop_queue_full_high_total` | `u64` | Route drops in high queue mode. |
+| `d2c_batches_total` | `u64` | ME D->C batch flushes. |
+| `d2c_batch_frames_total` | `u64` | ME D->C frames included in batches. |
+| `d2c_batch_bytes_total` | `u64` | ME D->C payload bytes included in batches. |
+| `d2c_flush_reason_queue_drain_total` | `u64` | Flushes caused by queue drain. |
+| `d2c_flush_reason_batch_frames_total` | `u64` | Flushes caused by frame-count batch limit. |
+| `d2c_flush_reason_batch_bytes_total` | `u64` | Flushes caused by byte-count batch limit. |
+| `d2c_flush_reason_max_delay_total` | `u64` | Flushes caused by max-delay budget. |
+| `d2c_flush_reason_ack_immediate_total` | `u64` | Flushes caused by immediate ACK policy. |
+| `d2c_flush_reason_close_total` | `u64` | Flushes caused by close path. |
+| `d2c_data_frames_total` | `u64` | ME D->C data frames. |
+| `d2c_ack_frames_total` | `u64` | ME D->C ACK frames. |
+| `d2c_payload_bytes_total` | `u64` | ME D->C payload bytes. |
+| `d2c_write_mode_coalesced_total` | `u64` | Coalesced D->C writes. |
+| `d2c_write_mode_split_total` | `u64` | Split D->C writes. |
+| `d2c_quota_reject_pre_write_total` | `u64` | D->C quota rejects before write. |
+| `d2c_quota_reject_post_write_total` | `u64` | D->C quota rejects after write. |
+| `d2c_frame_buf_shrink_total` | `u64` | D->C frame-buffer shrink operations. |
+| `d2c_frame_buf_shrink_bytes_total` | `u64` | Bytes released by D->C frame-buffer shrink operations. |
 | `socks_kdf_strict_reject_total` | `u64` | SOCKS KDF strict rejects. |
 | `socks_kdf_compat_fallback_total` | `u64` | SOCKS KDF compat fallbacks. |
 | `endpoint_quarantine_total` | `u64` | Endpoint quarantine activations. |
@@ -978,6 +1100,8 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `required_writers` | `usize` | Required writers based on current floor policy. |
 | `alive_writers` | `usize` | Writers currently alive. |
 | `coverage_pct` | `f64` | `alive_writers / required_writers * 100`. |
+| `fresh_alive_writers` | `usize` | Alive writers that match freshness requirements. |
+| `fresh_coverage_pct` | `f64` | `fresh_alive_writers / required_writers * 100`. |
 
 #### `MeWriterStatus`
 | Field | Type | Description |
@@ -992,6 +1116,12 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `bound_clients` | `usize` | Number of currently bound clients. |
 | `idle_for_secs` | `u64?` | Idle age in seconds if idle. |
 | `rtt_ema_ms` | `f64?` | RTT exponential moving average. |
+| `matches_active_generation` | `bool` | Whether this writer belongs to the active pool generation. |
+| `in_desired_map` | `bool` | Whether this writer's endpoint remains in desired topology. |
+| `allow_drain_fallback` | `bool` | Whether drain fallback is allowed for this writer. |
+| `drain_started_at_epoch_secs` | `u64?` | Unix timestamp when drain started. |
+| `drain_deadline_epoch_secs` | `u64?` | Unix timestamp of drain deadline. |
+| `drain_over_ttl` | `bool` | Whether drain has exceeded its TTL. |
 
 ### `DcStatusData`
 | Field | Type | Description |
@@ -1016,6 +1146,8 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `floor_capped` | `bool` | `true` when computed floor target was capped by active limits. |
 | `alive_writers` | `usize` | Alive writers in this DC. |
 | `coverage_pct` | `f64` | `alive_writers / required_writers * 100`. |
+| `fresh_alive_writers` | `usize` | Fresh alive writers in this DC. |
+| `fresh_coverage_pct` | `f64` | `fresh_alive_writers / required_writers * 100`. |
 | `rtt_ms` | `f64?` | Aggregated RTT for DC. |
 | `load` | `usize` | Active client sessions bound to this DC. |
 
@@ -1029,6 +1161,7 @@ Note: the request contract is defined, but the corresponding route currently ret
 | Field | Type | Description |
 | --- | --- | --- |
 | `username` | `string` | Username. |
+| `in_runtime` | `bool` | Whether current runtime config already contains this user. |
 | `user_ad_tag` | `string?` | Optional ad tag (32 hex chars). |
 | `max_tcp_conns` | `usize?` | Optional max concurrent TCP limit. |
 | `expiration_rfc3339` | `string?` | Optional expiration timestamp. |
@@ -1042,12 +1175,25 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `total_octets` | `u64` | Total traffic octets for this user. |
 | `links` | `UserLinks` | Active connection links derived from current config. |
 
+### `UserActiveIps`
+| Field | Type | Description |
+| --- | --- | --- |
+| `username` | `string` | Username with at least one active tracked source IP. |
+| `active_ips` | `ip[]` | Active source IPs for this user. |
+
 #### `UserLinks`
 | Field | Type | Description |
 | --- | --- | --- |
 | `classic` | `string[]` | Active `tg://proxy` links for classic mode. |
 | `secure` | `string[]` | Active `tg://proxy` links for secure/DD mode. |
 | `tls` | `string[]` | Active `tg://proxy` links for EE-TLS mode (for each host+TLS domain). |
+| `tls_domains` | `TlsDomainLink[]` | Extra TLS-domain links as explicit domain/link pairs for `censorship.tls_domains`. |
+
+#### `TlsDomainLink`
+| Field | Type | Description |
+| --- | --- | --- |
+| `domain` | `string` | TLS domain represented by the link. |
+| `link` | `string` | `tg://proxy` link for this domain. |
 
 Link generation uses active config and enabled modes:
 - Link port is `general.links.public_port` when configured; otherwise `server.port`.
@@ -1067,13 +1213,27 @@ Link generation uses active config and enabled modes:
 | `user` | `UserInfo` | Created or updated user view. |
 | `secret` | `string` | Effective user secret. |
 
+### `DeleteUserResponse`
+| Field | Type | Description |
+| --- | --- | --- |
+| `username` | `string` | Deleted username. |
+| `in_runtime` | `bool` | `true` when runtime config still contains the user and hot-reload has not applied deletion yet. |
+
+### `ResetUserQuotaResponse`
+| Field | Type | Description |
+| --- | --- | --- |
+| `username` | `string` | User whose runtime quota counter was reset. |
+| `used_bytes` | `u64` | Current used bytes after reset; always `0` on success. |
+| `last_reset_epoch_secs` | `u64` | Unix timestamp of the reset operation. |
+
 ## Mutation Semantics
 
 | Endpoint | Notes |
 | --- | --- |
 | `POST /v1/users` | Creates user, validates config, then atomically updates only affected `access.*` TOML tables (`access.users` always, plus optional per-user tables present in request). |
-| `PATCH /v1/users/{username}` | Partial update of provided fields only. Missing fields remain unchanged. Current implementation persists full config document on success. |
-| `POST /v1/users/{username}/rotate-secret` | Currently returns `404` in runtime route matcher; request schema is reserved for intended behavior. |
+| `PATCH /v1/users/{username}` | Partial update of provided fields only. Missing fields remain unchanged; explicit `null` removes optional per-user entries. The write path updates only affected `access.*` TOML tables. |
+| `POST /v1/users/{username}/rotate-secret` | Replaces the user's secret with a provided valid 32-hex value or a generated value, then returns the effective secret in `CreateUserResponse`. |
+| `POST /v1/users/{username}/reset-quota` | Resets the runtime quota counter for the route username, persists quota state to `general.quota_state_path`, and does not modify user config. |
 | `DELETE /v1/users/{username}` | Deletes only specified user, removes this user from related optional `access.user_*` maps, blocks last-user deletion, and atomically updates only related `access.*` TOML tables. |
 
 All mutating endpoints:
@@ -1148,5 +1308,4 @@ When `general.use_middle_proxy=true` and `general.me2dc_fallback=true`:
 
 ## Known Limitations (Current Release)
 
-- `POST /v1/users/{username}/rotate-secret` is currently unreachable in route matcher and returns `404`.
 - API runtime controls under `server.api` are documented as restart-required; hot-reload behavior for these fields is not strictly uniform in all change combinations.
